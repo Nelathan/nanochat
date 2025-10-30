@@ -58,6 +58,14 @@ eval_tokens = 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
+
+# Streaming Linear Settings
+enable_streaming = False  # enable streaming linear layers
+streaming_rank_k = 32  # rank for low-rank gradient compression
+streaming_power_iters = 1  # power iterations for subspace finding
+streaming_target_layers = "ffn_only"  # "ffn_only", "attention_only", or "all"
+streaming_min_layer_utilization = 2.0  # minimum layer size to compress
+streaming_warm_start_decay = 0.95  # decay factor for warm-start Q across steps
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -111,8 +119,24 @@ with torch.device("meta"):
     model = GPT(model_config)
 model.to_empty(device=device)
 model.init_weights()
-orig_model = model # original, uncompiled model, for saving raw model state_dict
-model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
+
+# Enable MoleGrad layers if requested
+if enable_streaming:
+    from nanochat.streaming_linear import MoleGradConfig
+
+    mole_cfg = MoleGradConfig(
+        rank_k=streaming_rank_k,
+        power_iters=streaming_power_iters,
+        reduce_orthogonalization=True,
+        min_layer_utilization=streaming_min_layer_utilization,
+        use_trust_scaling=True,
+        warm_start_decay=streaming_warm_start_decay,
+    )
+
+    model.enable_molegrad(mole_cfg, target_layers=streaming_target_layers)
+
+orig_model = model  # original, uncompiled model, for saving raw model state_dict
+model = torch.compile(model, dynamic=False)  # TODO: dynamic True/False think through
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()

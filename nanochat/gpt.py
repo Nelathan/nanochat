@@ -210,6 +210,23 @@ class GPT(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
+    def enable_molegrad(self, cfg, target_layers="ffn_only"):
+        """
+        Enable MoleGrad updates for memory-efficient training.
+
+        Args:
+            cfg: MoleGradConfig configuration
+            target_layers: "ffn_only", "attention_only", or "all"
+        """
+        from nanochat.streaming_linear import replace_linears_with_molegrad
+        replace_linears_with_molegrad(self, cfg, target_layers=target_layers)
+
+        # Print summary of what was replaced
+        total_params = sum(p.numel() for p in self.parameters())
+        mole_count = sum(1 for m in self.modules() if m.__class__.__name__ == 'MoleLinear')
+        print0(f"Enabled MoleGrad layers: {mole_count} layers replaced")
+        print0(f"Total model parameters: {total_params:,}")
+
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
