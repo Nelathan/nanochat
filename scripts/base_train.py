@@ -12,7 +12,7 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 """
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 from contextlib import nullcontext
 
@@ -59,13 +59,6 @@ core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 
-# Streaming Linear Settings
-enable_streaming = False  # enable streaming linear layers
-streaming_rank_k = 32  # rank for low-rank gradient compression
-streaming_power_iters = 1  # power iterations for subspace finding
-streaming_target_layers = "ffn_only"  # "ffn_only", "attention_only", or "all"
-streaming_min_layer_utilization = 2.0  # minimum layer size to compress
-streaming_warm_start_decay = 0.95  # decay factor for warm-start Q across steps
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -114,29 +107,34 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # -----------------------------------------------------------------------------
 # Initialize the Model
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
 model.to_empty(device=device)
 model.init_weights()
 
-# Enable MoleGrad layers if requested
-if enable_streaming:
-    from nanochat.streaming_linear import MoleGradConfig
-
-    mole_cfg = MoleGradConfig(
-        rank_k=streaming_rank_k,
-        power_iters=streaming_power_iters,
-        reduce_orthogonalization=True,
-        min_layer_utilization=streaming_min_layer_utilization,
-        use_trust_scaling=True,
-        warm_start_decay=streaming_warm_start_decay,
-    )
-
-    model.enable_molegrad(mole_cfg, target_layers=streaming_target_layers)
+mole_count = sum(1 for m in model.modules() if m.__class__.__name__ == 'MoleLinear')
+print0(f"MoleGrad layers: {mole_count}")
 
 orig_model = model  # original, uncompiled model, for saving raw model state_dict
-model = torch.compile(model, dynamic=False)  # TODO: dynamic True/False think through
+
+# Profiling setup (disabled by default, enable with --profile=True)
+profile_enabled = False  # set via CLI if needed
+if profile_enabled:
+    from torch.profiler import profile, ProfilerActivity, schedule
+    prof = profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=schedule(wait=1, warmup=1, active=3, repeat=1),
+        on_trace_ready=lambda p: p.export_chrome_trace(os.path.join(base_dir, "trace.json")),
+        record_shapes=True,
+        with_stack=True,
+    )
+    prof.start()
+else:
+    prof = None
+
+# model = torch.compile(model, dynamic=False)  # TODO: dynamic True/False think through
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -163,9 +161,13 @@ print0(f"Tokens : Params ratio: {total_batch_size * num_iterations / num_params:
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
-adamw_optimizer, muon_optimizer = optimizers
+# Initialize the Optimizers (may return 2 or more: AdamW, MoleOptimizer, Muon)
+optimizers = model.setup_optimizers(
+    unembedding_lr=unembedding_lr,
+    embedding_lr=embedding_lr,
+    matrix_lr=matrix_lr,
+    weight_decay=weight_decay,
+)
 
 # Initialize the DataLoaders for train/val
 base_dir = get_base_dir()
@@ -288,30 +290,65 @@ for step in range(num_iterations + 1):
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    # Detailed timing for first 5 steps
+    t_fwd = 0
+    t_bwd = 0
     for micro_step in range(grad_accum_steps):
+        if step < 5:
+            synchronize()
+            t_micro_start = time.time()
+
         with autocast_ctx:
             loss = model(x, y)
+
+        if step < 5:
+            synchronize()
+            t_fwd += time.time() - t_micro_start
+            t_bwd_start = time.time()
+
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
+
+        if step < 5:
+            synchronize()
+            t_bwd += time.time() - t_bwd_start
+
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # gradient clipping (TODO possibly experiment with)
+
+    if step < 5:
+        print0(f"  ├─ forward: {t_fwd * 1000:.2f}ms ({grad_accum_steps} micro-steps)")
+        print0(f"  ├─ backward: {t_bwd * 1000:.2f}ms ({grad_accum_steps} micro-steps)")
+    # gradient clipping
     if grad_clip > 0.0:
-        torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+        params_for_clipping = [p for p in orig_model.parameters() if p.grad is not None and isinstance(p.grad, torch.Tensor)]
+        if params_for_clipping:
+            torch.nn.utils.clip_grad_norm_(params_for_clipping, grad_clip)
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * lrm
     muon_momentum = get_muon_momentum(step)
-    for group in muon_optimizer.param_groups:
-        group["momentum"] = muon_momentum
+    for opt in optimizers:
+        for group in opt.param_groups:
+            if "momentum" in group:
+                group["momentum"] = muon_momentum
+    # Detailed timing breakdown for debugging
+    t_opt_start = time.time() if step < 5 else None
     for opt in optimizers:
         opt.step()
+    t_opt_end = time.time() if step < 5 else None
+
     model.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+
+    # Log optimizer step time for first 5 steps
+    if step < 5 and t_opt_start is not None:
+        opt_dt = (t_opt_end - t_opt_start) * 1000
+        print0(f"  └─ optimizer step: {opt_dt:.2f}ms")
     # -------------------------------------------------------------------------
 
     # logging
@@ -341,7 +378,7 @@ for step in range(num_iterations + 1):
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
-
+exit()
 # Log to report
 from nanochat.report import get_report
 get_report().log(section="Base model training", data=[

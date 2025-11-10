@@ -14,7 +14,7 @@ dependencies = [
     "setuptools>=80.9.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
-    "torch>=2.8.0",
+    "torch>=2.9.0",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
 ]
@@ -30,15 +30,10 @@ python-source = "."
 manifest-path = "rustbpe/Cargo.toml"
 
 [dependency-groups]
-dev = [
-    "maturin>=1.9.4",
-    "pytest>=8.0.0",
-]
+dev = ["maturin>=1.9.4", "pytest>=8.0.0"]
 
 [tool.pytest.ini_options]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
@@ -46,33 +41,30 @@ python_functions = ["test_*"]
 
 # target torch to cuda 12.8 or CPU
 [tool.uv.sources]
-torch = [  
-    { index = "pytorch-cpu", extra = "cpu" },  
-    { index = "pytorch-cu128", extra = "gpu" },  
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    #{ index = "pytorch-cu128", extra = "gpu" },
+    { index = "pytorch-cu130", extra = "gpu" },
 ]
 
-[[tool.uv.index]]  
-name = "pytorch-cpu"  
-url = "https://download.pytorch.org/whl/cpu"  
-explicit = true  
-  
-[[tool.uv.index]]  
-name = "pytorch-cu128"  
-url = "https://download.pytorch.org/whl/cu128"  
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-[project.optional-dependencies]  
-cpu = [  
-    "torch>=2.8.0",  
-]  
-gpu = [  
-    "torch>=2.8.0",  
-]  
-  
-[tool.uv]  
-conflicts = [  
-    [  
-        { extra = "cpu" },  
-        { extra = "gpu" },  
-    ],  
-]  
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[project.optional-dependencies]
+cpu = ["torch>=2.8.0"]
+gpu = ["torch>=2.8.0"]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]

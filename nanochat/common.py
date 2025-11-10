@@ -156,9 +156,19 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     # skipping full reproducibility for now, possibly investigate slowdown later
     # torch.use_deterministic_algorithms(True)
 
-    # Precision
+    # Precision: prefer new TF32 control APIs (PyTorch >= 2.9), with backward-compatible fallback
     if device_type == "cuda":
-        torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls
+        try:
+            # Matmul: choose TF32 or IEEE FP32 behavior
+            # 'tf32' enables TensorFloat-32 on Ampere+ for speed; equivalent to previous 'high' setting
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+            # cuDNN convolutions: align conv behavior with TF32 as well, if available
+            conv_backend = getattr(torch.backends.cudnn, "conv", None)
+            if conv_backend is not None and hasattr(conv_backend, "fp32_precision"):
+                conv_backend.fp32_precision = "tf32"
+        except Exception:
+            # Fallback for older PyTorch versions
+            torch.set_float32_matmul_precision("high")
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()

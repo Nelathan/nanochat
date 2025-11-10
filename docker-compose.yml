@@ -1,0 +1,37 @@
+version: '3'
+services:
+  nanochat:
+    build: .
+    container_name: nanochat
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - WANDB_ENTITY=${WANDB_ENTITY}
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - HF_HOME=/workspace/hf-cache
+    volumes:
+      - hf-cache:/workspace/hf-cache
+      - nanochat-cache:/root/.cache/nanochat
+      - uv-cache:/root/.cache/uv
+      - .:/workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    tty: true
+    stdin_open: true
+    env_file: ".env"
+
+volumes:
+  hf-cache:
+    name: "hf-cache"
+    external: true
+  nanochat-cache:
+    name: "nanochat-cache"
+    external: true
+  uv-cache:
+    name: "uv-cache"
+    # external: true

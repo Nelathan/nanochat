@@ -19,9 +19,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.common import get_dist_info, print0
+from nanochat.common import get_dist_info
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+from nanochat.molegrad import MoleLinear
+from nanochat.mole_optimizer import MoleOptimizer
 
 @dataclass
 class GPTConfig:
@@ -58,10 +60,11 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+        self.c_q = MoleLinear(self.n_embd, self.n_head * self.head_dim, 16)
+        self.c_k = MoleLinear(self.n_embd, self.n_kv_head * self.head_dim, 16)
+        self.c_v = MoleLinear(self.n_embd, self.n_kv_head * self.head_dim, 16)
+        self.c_proj = MoleLinear(self.n_embd, self.n_embd, 16)
 
     def forward(self, x, cos_sin, kv_cache):
         B, T, C = x.size()
@@ -113,8 +116,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = MoleLinear(config.n_embd, 4 * config.n_embd, 16)
+        self.c_proj = MoleLinear(4 * config.n_embd, config.n_embd, 16)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -171,7 +174,7 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, MoleLinear)):
             # https://arxiv.org/pdf/2310.17813
             fan_out = module.weight.size(0)
             fan_in = module.weight.size(1)
@@ -210,31 +213,31 @@ class GPT(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
-    def enable_molegrad(self, cfg, target_layers="ffn_only"):
-        """
-        Enable MoleGrad updates for memory-efficient training.
-
-        Args:
-            cfg: MoleGradConfig configuration
-            target_layers: "ffn_only", "attention_only", or "all"
-        """
-        from nanochat.streaming_linear import replace_linears_with_molegrad
-        replace_linears_with_molegrad(self, cfg, target_layers=target_layers)
-
-        # Print summary of what was replaced
-        total_params = sum(p.numel() for p in self.parameters())
-        mole_count = sum(1 for m in self.modules() if m.__class__.__name__ == 'MoleLinear')
-        print0(f"Enabled MoleGrad layers: {mole_count} layers replaced")
-        print0(f"Total model parameters: {total_params:,}")
 
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
-        matrix_params = list(self.transformer.h.parameters())
+
+        # MoleGrad only works in single GPU mode
+        if ddp:
+            raise ValueError("MoleGrad is single-GPU only. Run without DDP for now.")
+
+        mole_params = []
+        regular_matrix_params = []
+
+        for module in self.transformer.h.modules():
+            if isinstance(module, MoleLinear):
+                mole_params.append(module.weight)
+            elif isinstance(module, nn.Linear):
+                regular_matrix_params.append(module.weight)
+
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+
+        total_params = len(mole_params) + len(regular_matrix_params) + len(embedding_params) + len(lm_head_params)
+        assert len(list(self.parameters())) == total_params, \
+            f"Parameter count mismatch: {len(list(self.parameters()))} != {total_params}"
+
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -247,12 +250,18 @@ class GPT(nn.Module):
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
-        # Create the Muon optimizer for the linear layers
-        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
-        MuonFactory = DistMuon if ddp else Muon
-        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
-        # Combine them the two optimizers into one list
-        optimizers = [adamw_optimizer, muon_optimizer]
+
+        optimizers = [adamw_optimizer]
+        if mole_params:
+            mole_optimizer = MoleOptimizer(mole_params, lr=matrix_lr)
+            optimizers.append(mole_optimizer)
+
+        if regular_matrix_params:
+            muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+            MuonFactory = DistMuon if ddp else Muon
+            muon_optimizer = MuonFactory(regular_matrix_params, **muon_kwargs)
+            optimizers.append(muon_optimizer)
+
         for opt in optimizers:
             for group in opt.param_groups:
                 group["initial_lr"] = group["lr"]

@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Rust
+rustbpe/target/
+rustbpe/Cargo.lock
+
+# Virtual Environment
+venv/
+.env/
+.venv/
+env/
+
+# Development
+.git
+.gitignore
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Wandb
+wandb/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.docker/
+
+# Documentation
+docs/
+*.md
+!README.md

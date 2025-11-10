@@ -105,7 +105,7 @@ python -m scripts.base_train \
 ### Core Components
 
 1. **GPT Model** (`nanochat/gpt.py`): Transformer architecture with rotary embeddings, QK norm, MQA support
-2. **MoleGrad** (`nanochat/streaming_linear.py`): Low-rank gradient updates tunnel through subspace
+2. **MoleGrad** (`nanochat/molegrad.py`): Low-rank gradient updates tunnel through subspace
 3. **Tokenizer** (`nanochat/tokenizer.py`): BPE tokenizer with special tokens for conversations and tool use
 4. **Data Loader** (`nanochat/dataloader.py`): Distributed tokenizing data loader for pretraining
 5. **Engine** (`nanochat/engine.py`): Efficient inference engine with KV cache
