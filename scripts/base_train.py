@@ -290,40 +290,20 @@ for step in range(num_iterations + 1):
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    # Detailed timing for first 5 steps
-    t_fwd = 0
-    t_bwd = 0
     for micro_step in range(grad_accum_steps):
-        if step < 5:
-            synchronize()
-            t_micro_start = time.time()
-
         with autocast_ctx:
             loss = model(x, y)
-
-        if step < 5:
-            synchronize()
-            t_fwd += time.time() - t_micro_start
-            t_bwd_start = time.time()
 
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
 
-        if step < 5:
-            synchronize()
-            t_bwd += time.time() - t_bwd_start
-
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-
-    if step < 5:
-        print0(f"  ├─ forward: {t_fwd * 1000:.2f}ms ({grad_accum_steps} micro-steps)")
-        print0(f"  ├─ backward: {t_bwd * 1000:.2f}ms ({grad_accum_steps} micro-steps)")
     # gradient clipping
-    if grad_clip > 0.0:
-        params_for_clipping = [p for p in orig_model.parameters() if p.grad is not None and isinstance(p.grad, torch.Tensor)]
-        if params_for_clipping:
-            torch.nn.utils.clip_grad_norm_(params_for_clipping, grad_clip)
+    grad_clip_enabled = grad_clip > 0.0
+    if grad_clip_enabled:
+        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+        grad_norm = grad_norm_tensor.item() # GPU tensor -> CPU float (note: cpu-gpu sync point)
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
@@ -334,36 +314,29 @@ for step in range(num_iterations + 1):
         for group in opt.param_groups:
             if "momentum" in group:
                 group["momentum"] = muon_momentum
-    # Detailed timing breakdown for debugging
-    t_opt_start = time.time() if step < 5 else None
     for opt in optimizers:
         opt.step()
-    t_opt_end = time.time() if step < 5 else None
 
     model.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
-
-    # Log optimizer step time for first 5 steps
-    if step < 5 and t_opt_start is not None:
-        opt_dt = (t_opt_end - t_opt_start) * 1000
-        print0(f"  └─ optimizer step: {opt_dt:.2f}ms")
     # -------------------------------------------------------------------------
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
-    tok_per_sec = int(world_tokens_per_fwdbwd / dt)
+    tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 100 == 0:
-        wandb_run.log({
+        log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -372,7 +345,10 @@ for step in range(num_iterations + 1):
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
-        })
+        }
+        if grad_clip_enabled:
+            log_data["train/grad_norm"] = grad_norm
+        wandb_run.log(log_data)
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
