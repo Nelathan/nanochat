@@ -1,6 +1,8 @@
-# nanochat RTX 5090 MoleGrad Agenda
+# AGENDA (Archived)
 
-## Vision
+> **Note**: This file is archived. See `mole/README.md` for the current project status and vision.
+
+## Vision (Original)
 
 **"The best ChatGPT that $10 can buy"** - Enable training large context language models on consumer RTX 5090 hardware through MoleGrad low-rank gradient updates.
 

@@ -66,25 +66,25 @@ fi
 
 #failfast
 uv run -m scripts.base_train \
-    --depth=12 \
-    --max_seq_len=1024 \
-    --device_batch_size=8 \
-    --total_batch_size=8192 \
-    --num_iterations=500 \
-    --eval_every=10000 \
-    --eval_tokens=32000 \
+    --depth=8 \
+    --max_seq_len=1024 --device_batch_size=64 --grad_accum_steps=1 \
+    --num_iterations=10000 \
+    --eval_every=500 \
+    --eval_tokens=64000 \
+    --core_metric_every=-1 --save_every=-1 \
+    --mlp_mult=2 --num_kv_heads=1 \
+    --run=mole-erf-gqa1-1
 
 # Full training run
 uv run -m scripts.base_train \
     --depth=12 \
-    --max_seq_len=2048 \
-    --device_batch_size=4 \
-    --total_batch_size=8192 \
-    --eval_every=10000 \
+    --max_seq_len=1024 --device_batch_size=16 --grad_accum_steps=1 \
+    --num_iterations=10000 \
+    --eval_every=1000 \
     --eval_tokens=128000 \
     --core_metric_every=50000 \
     --sample_every=10000 \
-    --run=$WANDB_RUN
+    --run=mini_1
 
 # Quick evaluation on small data subset
 uv run -m scripts.base_loss --device_batch_size=1 --split_tokens=8192

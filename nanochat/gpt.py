@@ -18,12 +18,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from nanochat.common import get_dist_info
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
-from nanochat.molegrad import MoleLinear
-from nanochat.mole_optimizer import MoleOptimizer
+from mole import MoleLinear, MoleOptimizer
 
 @dataclass
 class GPTConfig:
@@ -33,6 +33,9 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    mlp_mult: int = 4  # MLP hidden width multiplier
+    use_checkpoint: bool = False  # gradient checkpointing to save memory
+    use_mlp_checkpoint: bool = True # Only checkpoint the MLP (best speed trade-off)
 
 
 def norm(x):
@@ -61,10 +64,10 @@ class CausalSelfAttention(nn.Module):
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
 
-        self.c_q = MoleLinear(self.n_embd, self.n_head * self.head_dim, 16)
-        self.c_k = MoleLinear(self.n_embd, self.n_kv_head * self.head_dim, 16)
-        self.c_v = MoleLinear(self.n_embd, self.n_kv_head * self.head_dim, 16)
-        self.c_proj = MoleLinear(self.n_embd, self.n_embd, 16)
+        self.c_q = MoleLinear(self.n_embd, self.n_head * self.head_dim)
+        self.c_k = MoleLinear(self.n_embd, self.n_kv_head * self.head_dim)
+        self.c_v = MoleLinear(self.n_embd, self.n_kv_head * self.head_dim)
+        self.c_proj = MoleLinear(self.n_embd, self.n_embd)
 
     def forward(self, x, cos_sin, kv_cache):
         B, T, C = x.size()
@@ -116,10 +119,17 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = MoleLinear(config.n_embd, 4 * config.n_embd, 16)
-        self.c_proj = MoleLinear(4 * config.n_embd, config.n_embd, 16)
+        hidden = config.mlp_mult * config.n_embd
+        self.c_fc = MoleLinear(config.n_embd, hidden)
+        self.c_proj = MoleLinear(hidden, config.n_embd)
+        self.use_checkpoint = config.use_mlp_checkpoint
 
     def forward(self, x):
+        if self.training and self.use_checkpoint:
+            return checkpoint(self._forward_impl, x, use_reentrant=False)
+        return self._forward_impl(x)
+
+    def _forward_impl(self, x):
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
@@ -174,8 +184,15 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, MoleLinear)):
+        if isinstance(module, MoleLinear):
             # https://arxiv.org/pdf/2310.17813
+            fan_out = module.weight.size(0)
+            fan_in = module.weight.size(1)
+            std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            # Initialize Q for MoleLinear
+            module.init_Q()
+        elif isinstance(module, nn.Linear):
             fan_out = module.weight.size(0)
             fan_in = module.weight.size(1)
             std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
@@ -222,19 +239,19 @@ class GPT(nn.Module):
         if ddp:
             raise ValueError("MoleGrad is single-GPU only. Run without DDP for now.")
 
-        mole_params = []
+        mole_modules = []
         regular_matrix_params = []
 
         for module in self.transformer.h.modules():
             if isinstance(module, MoleLinear):
-                mole_params.append(module.weight)
+                mole_modules.append(module)
             elif isinstance(module, nn.Linear):
                 regular_matrix_params.append(module.weight)
 
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
 
-        total_params = len(mole_params) + len(regular_matrix_params) + len(embedding_params) + len(lm_head_params)
+        total_params = len(mole_modules) + len(regular_matrix_params) + len(embedding_params) + len(lm_head_params)
         assert len(list(self.parameters())) == total_params, \
             f"Parameter count mismatch: {len(list(self.parameters()))} != {total_params}"
 
@@ -251,9 +268,10 @@ class GPT(nn.Module):
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
 
-        optimizers = [adamw_optimizer]
-        if mole_params:
-            mole_optimizer = MoleOptimizer(mole_params, lr=matrix_lr)
+        optimizers: list[torch.optim.Optimizer] = [adamw_optimizer]
+        if mole_modules:
+            # Optional: enable compile_core=True to try torch.compile on the MoleGrad core update.
+            mole_optimizer = MoleOptimizer(mole_modules, lr=matrix_lr)
             optimizers.append(mole_optimizer)
 
         if regular_matrix_params:
@@ -282,7 +300,11 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+            if self.config.use_checkpoint and self.training:
+                # Gradient checkpointing: recompute activations in backward
+                x = checkpoint(block, x, cos_sin, kv_cache, use_reentrant=False)
+            else:
+                x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)

@@ -18,6 +18,10 @@ from contextlib import nullcontext
 
 import wandb
 import torch
+import torch._dynamo
+
+# Limit compile cache to reduce memory
+torch._dynamo.config.cache_size_limit = 8
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
@@ -37,13 +41,19 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 # Model architecture
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 2048 # max context length
+use_checkpoint = False # gradient checkpointing: saves ~50% activation memory, costs ~20% compute
+
+# Architecture overrides (optional)
+mlp_mult = 4  # MLP expansion multiplier (GPT-2 style is 4). Try 2 for a slimmer model.
+num_kv_heads = -1  # KV heads for GQA. -1 => match num_heads (GQA disabled). Try 1 for 1 KV head/layer.
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
 device_batch_size = 32 # per-device batch size (set to not OOM)
-total_batch_size = 524288 # total desired batch size, in #tokens
+grad_accum_steps = -1 # if set > 0, overrides total_batch_size calculation
+total_batch_size = 524288 # total desired batch size, in #tokens (ignored if grad_accum_steps > 0)
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (Adam)
@@ -76,6 +86,14 @@ autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
+# Memory profiling: record history for visualization
+# View with: chrome://tracing or https://ui.perfetto.dev
+# if device_type == "cuda":
+#     memory_snapshot_dir = os.path.join(get_base_dir(), "memory_snapshots")
+#     os.makedirs(memory_snapshot_dir, exist_ok=True)
+#     torch.cuda.memory._record_memory_history(max_entries=100000)
+#     print0(f"Memory recording enabled. Snapshots will be saved to {memory_snapshot_dir}")
+
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
@@ -90,18 +108,33 @@ print0(f"Vocab size: {vocab_size:,}")
 num_layers = depth
 model_dim = depth * 64 # aspect ratio 64 (usually this is varied from 64 -> 128 as model size increases)
 num_heads = max(1, (model_dim + 127) // 128) # head dim 128 (the division here is ceil div)
-num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
+
+# If user didn't override, default to no-GQA (kv heads match query heads)
+if num_kv_heads <= 0:
+    num_kv_heads = num_heads
+
+assert num_kv_heads <= num_heads and num_heads % num_kv_heads == 0, \
+    f"Invalid GQA setting: num_heads={num_heads}, num_kv_heads={num_kv_heads}"
+
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
 print0(f"num_heads: {num_heads}")
 print0(f"num_kv_heads: {num_kv_heads}")
-
+print0(f"mlp_mult: {mlp_mult}")
 # Optimizer / data / training length related hyperparameters
 # figure out the needed gradient accumulation to reach the desired total batch size
 tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+
+if grad_accum_steps > 0:
+    # User specified grad_accum_steps directly
+    total_batch_size = world_tokens_per_fwdbwd * grad_accum_steps
+    print0(f"Using explicit grad_accum_steps: {grad_accum_steps}")
+else:
+    # User specified total_batch_size, calculate grad_accum_steps
+    assert total_batch_size % world_tokens_per_fwdbwd == 0
+    grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+
 print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
@@ -110,7 +143,17 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(
+    sequence_len=max_seq_len,
+    vocab_size=vocab_size,
+    n_layer=num_layers,
+    n_head=num_heads,
+    n_kv_head=num_kv_heads,
+    n_embd=model_dim,
+    mlp_mult=mlp_mult,
+    use_checkpoint=False, # We now use granular MLP checkpointing by default
+    use_mlp_checkpoint=True,
+)
 
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
@@ -130,10 +173,22 @@ if resuming:
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 mole_count = sum(1 for m in model.modules() if m.__class__.__name__ == 'MoleLinear')
 print0(f"MoleGrad layers: {mole_count}")
+
+# Log which SDPA backend will be used
+if device_type == "cuda":
+    backends = []
+    if torch.backends.cuda.flash_sdp_enabled():
+        backends.append("FlashAttention")
+    if torch.backends.cuda.mem_efficient_sdp_enabled():
+        backends.append("MemEfficient")
+    if torch.backends.cuda.math_sdp_enabled():
+        backends.append("Math")
+    if hasattr(torch.backends.cuda, 'cudnn_sdp_enabled') and torch.backends.cuda.cudnn_sdp_enabled():
+        backends.append("cuDNN")
+    print0(f"SDPA backends available: {', '.join(backends) if backends else 'None'}")
 
 orig_model = model  # original, uncompiled model, for saving raw model state_dict
 
@@ -152,7 +207,9 @@ if profile_enabled:
 else:
     prof = None
 
-# model = torch.compile(model, dynamic=False)  # TODO: dynamic True/False think through
+model = torch.compile(
+    model, options={"triton.cudagraphs": True}, fullgraph=True
+)
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -246,7 +303,7 @@ while True:
     if last_step or step % eval_every == 0:
         model.eval()
         val_loader = build_val_loader()
-        eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
+        eval_steps = max(1, eval_tokens // (device_batch_size * max_seq_len * ddp_world_size))
         with autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
@@ -330,14 +387,35 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    # Detailed timing for first 5 steps
+    t_fwd = 0
+    t_bwd = 0
+
     for micro_step in range(grad_accum_steps):
+        if step < 5:
+            synchronize()
+            t_micro_start = time.time()
+
         with autocast_ctx:
             loss = model(x, y)
+
+        if step < 5:
+            synchronize()
+            t_fwd += time.time() - t_micro_start
+            t_bwd_start = time.time()
 
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+
+        if step < 5:
+            synchronize()
+            t_bwd += time.time() - t_bwd_start
+
+    if step < 5:
+        print0(f"  ├─ forward: {t_fwd * 1000:.2f}ms ({grad_accum_steps} micro-steps)")
+        print0(f"  ├─ backward: {t_bwd * 1000:.2f}ms ({grad_accum_steps} micro-steps)")
     # gradient clipping
     grad_clip_enabled = grad_clip > 0.0
     if grad_clip_enabled:
@@ -353,13 +431,22 @@ while True:
         for group in opt.param_groups:
             if "momentum" in group:
                 group["momentum"] = muon_momentum
+    # Detailed timing breakdown for debugging
+    t_opt_start = time.time() if step < 5 else None
     for opt in optimizers:
         opt.step()
+    t_opt_end = time.time() if step < 5 else None
 
     model.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+
+    # Log optimizer step time for first 5 steps
+    if step < 5:
+        if t_opt_start is not None and t_opt_end is not None:
+            opt_dt = (t_opt_end - t_opt_start) * 1000
+            print0(f"  └─ optimizer step: {opt_dt:.2f}ms")
     # -------------------------------------------------------------------------
 
     # logging
@@ -369,13 +456,32 @@ while True:
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
-    promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
-    mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
+    # Get theoretical peak TFLOPS for the GPU (bf16 Tensor Core, dense)
+    # Source: NVIDIA specs, Gemini research
+    if not hasattr(evaluate_bpb, '_gpu_tflops'):
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+        if "H100" in gpu_name and "PCIe" in gpu_name:
+            evaluate_bpb._gpu_tflops = 756e12   # H100 PCIe
+        elif "H100" in gpu_name:
+            evaluate_bpb._gpu_tflops = 989e12   # H100 SXM
+        elif "4090" in gpu_name:
+            evaluate_bpb._gpu_tflops = 330e12   # RTX 4090 bf16 Tensor
+        elif "4080" in gpu_name:
+            evaluate_bpb._gpu_tflops = 232e12   # RTX 4080 bf16 Tensor
+        elif "4070" in gpu_name:  # 4070, 4070 Ti, 4070 Super
+            evaluate_bpb._gpu_tflops = 284e12   # RTX 4070 Super bf16 Tensor
+        elif "3090" in gpu_name:
+            evaluate_bpb._gpu_tflops = 142e12   # RTX 3090 bf16 Tensor
+        else:
+            evaluate_bpb._gpu_tflops = 989e12   # default to H100 SXM for backwards compat
+        print0(f"GPU: {gpu_name}, theoretical bf16 Tensor TFLOPS: {evaluate_bpb._gpu_tflops/1e12:.1f}")
+    promised_flops_per_sec = evaluate_bpb._gpu_tflops * ddp_world_size
+    mfu = 100 * flops_per_sec / promised_flops_per_sec # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
-    if step % 100 == 0:
+    if step % 50 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
@@ -388,10 +494,28 @@ while True:
         }
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
+
+        # Log optimizer metrics (e.g. MoleOptimizer stats)
+        for opt in optimizers:
+            if hasattr(opt, "metrics"):
+                log_data.update(opt.metrics)
+
         wandb_run.log(log_data)
+
+    # Clear CUDA cache every 50 steps to see memory pattern and reduce fragmentation
+    # if device_type == "cuda" and step % 50 == 0:
+    #     torch.cuda.empty_cache()
 
     # state update
     step += 1
+
+# Save memory snapshot before exit
+# if device_type == "cuda":
+#     snapshot_file = os.path.join(memory_snapshot_dir, f"memory_snapshot_{run}.pickle")
+#     torch.cuda.memory._dump_snapshot(snapshot_file)
+#     print0(f"Memory snapshot saved to {snapshot_file}")
+#     print0("View at: https://pytorch.org/memory_viz  (drag & drop the .pickle file)")
+#     torch.cuda.memory._record_memory_history(enabled=None)  # Stop recording
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
