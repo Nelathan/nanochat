@@ -11,8 +11,17 @@ services:
     volumes:
       - hf-cache:/workspace/hf-cache
       - nanochat-cache:/root/.cache/nanochat
-      - uv-cache:/root/.cache/uv
-      - .:/workspace
+      - ./mole:/workspace/mole
+      - ./nanochat:/workspace/nanochat
+      - ./outputs:/workspace/outputs
+      - ./rustbpe:/workspace/rustbpe
+      - ./scripts:/workspace/scripts
+      - ./tasks:/workspace/tasks
+      - ./tests:/workspace/tests
+      - ./.python-version:/workspace/.python-version
+      - ./pyproject.toml:/workspace/pyproject.toml
+      - ./uv.lock:/workspace/uv.lock
+      - ./README.md:/workspace/README.md
     deploy:
       resources:
         reservations:
@@ -31,6 +40,3 @@ volumes:
   nanochat-cache:
     name: "nanochat-cache"
     external: true
-  uv-cache:
-    name: "uv-cache"
-    # external: true

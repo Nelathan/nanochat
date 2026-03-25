@@ -28,9 +28,8 @@ class MoleLinear(nn.Module):
         self.bias = None
 
         # Subspace state and accumulators
-        self.register_buffer("Q", torch.empty(in_features, rank_k))
-        self.register_buffer("mole_grad", torch.zeros(out_features, rank_k), persistent=False)
-        # subspace_z removed
+        self.register_buffer("mole_Q", torch.empty(in_features, rank_k))
+        self.register_buffer("mole_Y", torch.zeros(out_features, rank_k), persistent=False)
 
         self.reset_parameters()
 
@@ -42,8 +41,8 @@ class MoleLinear(nn.Module):
         Q_init = torch.randn(self.in_features, self.rank_k, device=self.weight.device, dtype=torch.float32)
         Q_init, _ = torch.linalg.qr(Q_init, mode="reduced")
         Q_init = F.normalize(Q_init, dim=0)
-        self.Q.copy_(Q_init.to(self.weight.dtype))
-        self.mole_grad.zero_()
+        self.mole_Q.copy_(Q_init.to(self.weight.dtype))
+        self.mole_Y.zero_()
 
     def init_Q(self):
         """Compatibility alias for resetting the subspace buffers."""
@@ -53,13 +52,13 @@ class MoleLinear(nn.Module):
         if self.training:
             # 1. Compute AQ for backward (needed for gradient projection)
             x_flat = x.view(-1, x.shape[-1])
-            Q_cast = self.Q if self.Q.dtype == x.dtype else self.Q.to(x.dtype)
+            Q_cast = self.mole_Q if self.mole_Q.dtype == x.dtype else self.mole_Q.to(x.dtype)
             AQ = x_flat @ Q_cast
 
             # Z-estimation removed: We now use "Scout Renewal" strategy in optimizer
             # which relies purely on gradient utility (eigenvalues of Y^T Y)
 
-            return MoleGradFn.apply(x, self.weight, AQ, self.mole_grad)
+            return MoleGradFn.apply(x, self.weight, AQ, self.mole_Y)
         return nn.functional.linear(x, self.weight, None)
 
     def extra_repr(self) -> str:

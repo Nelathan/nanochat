@@ -28,10 +28,10 @@ loss.backward()
 
 # 4. Verify Gradients
 print("Verifying Gradients...")
-if model.mole_grad is None:
-    print("❌ FAIL: mole_grad is None")
-elif model.mole_grad.abs().sum() == 0:
-    print("⚠️ WARNING: mole_grad is all zeros (might be correct if inputs were zero, but unlikely)")
+if model.mole_Y is None:
+    print("❌ FAIL: mole_Y is None")
+elif model.mole_Y.abs().sum() == 0:
+    print("⚠️ WARNING: mole_Y is all zeros (might be correct if inputs were zero, but unlikely)")
 else:
-    print(f"✅ SUCCESS: mole_grad populated. Shape: {model.mole_grad.shape}")
+    print(f"✅ SUCCESS: mole_Y populated. Shape: {model.mole_Y.shape}")
     print("Graph capture successful!")

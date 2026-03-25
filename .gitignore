@@ -6,3 +6,5 @@ dev-ignore/
 report.md
 eval_bundle/
 wandb/
+.env
+.vscode/
